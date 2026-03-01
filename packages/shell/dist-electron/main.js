@@ -51,6 +51,24 @@ var ViewManager = class {
 			});
 		});
 	}
+	async sendScroll(appId, deltaY) {
+		const view = this.viewPool.get(appId);
+		if (!view) return false;
+		try {
+			view.webContents.focus();
+			const { width, height } = view.getBounds();
+			await view.webContents.sendInputEvent({
+				type: "mouseWheel",
+				x: Math.round(width / 2),
+				y: Math.round(height / 2),
+				deltaY
+			});
+			return true;
+		} catch (error) {
+			console.error(`[ViewManager] 滚动失败:`, error);
+			return false;
+		}
+	}
 	resizeView(activeView) {
 		this.updateLayout();
 	}
@@ -163,19 +181,26 @@ const SYSTEM_CHANNELS = { CAPTURE_PAGE: "system:capture-page" };
 var SYSTEM_PROMPT = `
 你是一个 GUI 自动化助手 OpenClaw。
 你的任务是根据用户指令和屏幕截图，输出 JSON 格式的操作指令。
+
 请严格遵守以下 JSON 格式返回，不要包含 markdown 代码块：
 {
-  "reason": "...",
-  "action": "click",
-  "targetType": "coordinate" | "text", 
-  "coordinates": [x, y],       // 方案A：视觉坐标
-  "text": "按钮上的文字"        // 方案B：DOM 语义
+  "reason": "简述思考过程 (例如：页面还没到底，继续滚动)",
+  "action": "click" | "type" | "scroll" | "done",
+  "text": "...",
+  "coordinates": [x, y],
+  "direction": "down" | "up"
 }
+
+重要规则：
+1. 这是一个循环过程。执行完动作后，你会看到新的界面。
+2. 如果任务完成了，必须返回 { "action": "done" } 结束循环。
+3. 如果需要连续操作（例如先点击搜索框再输入），请分步执行，不要试图一次性返回多个指令。
 `;
 var AiService = class {
 	apiKey = "8abb4d8931c046429863be95c2cc35e0.bnkw9V237nMQVWYW";
 	baseUrl = "https://open.bigmodel.cn/api/paas/v4";
 	viewManager;
+	MAX_STEPS = 10;
 	constructor(viewManager$1) {
 		this.viewManager = viewManager$1;
 		this.initHandlers();
@@ -187,91 +212,120 @@ var AiService = class {
 				role: "system",
 				content: SYSTEM_PROMPT
 			}, ...config.messages];
-			console.log("[AiService] 请求 Zhipu GLM-4V:", {
-				msgCount: messages.length,
-				hasImage: JSON.stringify(messages).includes("image_url")
-			});
-			try {
-				const response = await axios.post(`${this.baseUrl}/chat/completions`, {
-					model: "glm-4v",
-					messages,
-					stream: true,
-					temperature: .1,
-					max_tokens: 1024
-				}, {
-					headers: {
-						"Authorization": `Bearer ${this.apiKey}`,
-						"Content-Type": "application/json"
-					},
-					responseType: "stream"
-				});
-				let buffer = "";
-				response.data.on("data", (chunk) => {
-					const lines = chunk.toString().split("\n").filter((line) => line.trim() !== "");
-					for (const line of lines) {
-						const message = line.replace(/^data: /, "");
-						if (message === "[DONE]") {
-							this.tryExecuteAction(buffer, sender);
-							sender.send(AI_CHANNELS.STREAM_END);
-							return;
-						}
-						try {
-							const content = JSON.parse(message).choices[0].delta?.content;
-							if (content) {
-								buffer += content;
-								sender.send(AI_CHANNELS.STREAM_CHUNK, content);
-							}
-						} catch (e) {}
-					}
-				});
-			} catch (error) {
-				sender.send(AI_CHANNELS.STREAM_ERROR, `API Error: ${error.message}`);
-			}
+			await this.runAgentLoop(messages, sender, 1);
 		});
 	}
-	async tryExecuteAction(response, sender) {
+	async runAgentLoop(messages, sender, step) {
+		if (step > this.MAX_STEPS) {
+			sender.send(AI_CHANNELS.STREAM_CHUNK, "\n🛑 达到最大步数限制，强制停止。");
+			sender.send(AI_CHANNELS.STREAM_END);
+			return;
+		}
+		sender.send(AI_CHANNELS.STREAM_CHUNK, `\n\n🔄 [Step ${step}] 思考中...`);
 		try {
-			const jsonMatch = response.match(/\{[\s\S]*\}/);
-			if (!jsonMatch) return;
-			const actionData = JSON.parse(jsonMatch[0]);
-			console.log("🤖 AI 指令:", actionData);
-			if (actionData.action === "click") {
-				let success = false;
-				if (actionData.text) {
-					sender.send(AI_CHANNELS.STREAM_CHUNK, `\n🔍 [尝试] 正在查找文本 "${actionData.text}"...`);
-					success = await this.viewManager.sendClickByText("docs", actionData.text);
-					if (success) {
-						sender.send(AI_CHANNELS.STREAM_CHUNK, `\n✅ [成功] 已通过文本点击。`);
-						return;
-					} else sender.send(AI_CHANNELS.STREAM_CHUNK, `\n⚠️ [失败] 未找到文本元素。`);
-				}
-				if (!success && actionData.coordinates) {
-					sender.send(AI_CHANNELS.STREAM_CHUNK, `\n🔄 [降级] 切换视觉坐标模式...`);
-					const [x, y] = actionData.coordinates;
-					success = await this.viewManager.sendClick("docs", x, y);
-					if (success) {
-						sender.send(AI_CHANNELS.STREAM_CHUNK, `\n✅ [成功] 已点击坐标 [${x}, ${y}]。`);
+			console.log(`[AiService] Step ${step} 请求 GLM-4V`);
+			const response = await axios.post(`${this.baseUrl}/chat/completions`, {
+				model: "glm-4v",
+				messages,
+				stream: true,
+				temperature: .1,
+				max_tokens: 1024
+			}, {
+				headers: {
+					"Authorization": `Bearer ${this.apiKey}`,
+					"Content-Type": "application/json"
+				},
+				responseType: "stream"
+			});
+			let buffer = "";
+			response.data.on("data", async (chunk) => {
+				const lines = chunk.toString().split("\n").filter((line) => line.trim() !== "");
+				for (const line of lines) {
+					const message = line.replace(/^data: /, "");
+					if (message === "[DONE]") {
+						await this.handleTurnComplete(buffer, messages, sender, step);
 						return;
 					}
+					try {
+						const content = JSON.parse(message).choices[0].delta?.content;
+						if (content) {
+							buffer += content;
+							sender.send(AI_CHANNELS.STREAM_CHUNK, content);
+						}
+					} catch (e) {}
 				}
-				if (!success) {
-					const errorMsg = "操作失败：无法通过文本或坐标定位元素，请确认界面状态。";
-					sender.send(AI_CHANNELS.STREAM_CHUNK, `\n❌ ${errorMsg}`);
-					sender.send(AI_CHANNELS.STREAM_ERROR, errorMsg);
-				}
-			} else if (actionData.action === "type" && actionData.text) {
-				sender.send(AI_CHANNELS.STREAM_CHUNK, `\n⌨️ [输入] 正在输入 "${actionData.text}"...`);
-				if (await this.viewManager.sendText("docs", actionData.text)) sender.send(AI_CHANNELS.STREAM_CHUNK, `\n✅ [成功] 输入完成。`);
-				else {
-					const errorMsg = "❌ 输入失败：无法聚焦或发送按键。";
-					sender.send(AI_CHANNELS.STREAM_CHUNK, `\n${errorMsg}`);
-					sender.send(AI_CHANNELS.STREAM_ERROR, errorMsg);
-				}
-			} else if (actionData.action === "done") sender.send(AI_CHANNELS.STREAM_CHUNK, `\n🎉 任务已完成。`);
-		} catch (e) {
-			console.warn("无法解析 AI 指令:", e);
-			sender.send(AI_CHANNELS.STREAM_ERROR, "指令解析异常，请重试");
+			});
+		} catch (error) {
+			const errorMsg = error.response?.data?.error?.message || error.message;
+			sender.send(AI_CHANNELS.STREAM_ERROR, `API Error: ${errorMsg}`);
 		}
+	}
+	async handleTurnComplete(aiResponseText, history, sender, currentStep) {
+		try {
+			const jsonMatch = aiResponseText.match(/\{[\s\S]*\}/);
+			if (!jsonMatch) {
+				sender.send(AI_CHANNELS.STREAM_END);
+				return;
+			}
+			const actionData = JSON.parse(jsonMatch[0]);
+			console.log(`🤖 Step ${currentStep} 指令:`, actionData);
+			if (actionData.action === "done") {
+				sender.send(AI_CHANNELS.STREAM_CHUNK, "\n🎉 任务完成");
+				sender.send(AI_CHANNELS.STREAM_END);
+				return;
+			}
+			const executionResult = await this.executeAction(actionData, sender);
+			history.push({
+				role: "assistant",
+				content: aiResponseText
+			});
+			const newSnapshot = await this.viewManager.captureSnapshot("docs");
+			let feedbackContent = [{
+				type: "text",
+				text: `动作已执行,结果：${executionResult}。\n这是执行后的新界面截图,请判断下一步操作。如果任务已完成,请返回 {"action": "done"}`
+			}];
+			if (newSnapshot) feedbackContent.push({
+				type: "image_url",
+				image_url: { url: newSnapshot }
+			});
+			history.push({
+				role: "user",
+				content: feedbackContent
+			});
+			await this.runAgentLoop(history, sender, currentStep + 1);
+		} catch (e) {
+			console.warn("Loop Error:", e);
+			sender.send(AI_CHANNELS.STREAM_ERROR, "执行循环异常");
+		}
+	}
+	async executeAction(actionData, sender) {
+		let result = "未知操作";
+		const vm = this.viewManager;
+		const targetApp = "docs";
+		if (actionData.action === "click") {
+			if (actionData.text) {
+				sender.send(AI_CHANNELS.STREAM_CHUNK, `\n🔍 查找文本:"${actionData.text}"`);
+				if (await vm.sendClickByText(targetApp, actionData.text)) return "点击文本成功";
+			}
+			if (actionData.coordinates) {
+				sender.send(AI_CHANNELS.STREAM_CHUNK, `\n🖱️ 点击坐标: [${actionData.coordinates}]`);
+				const [x, y] = actionData.coordinates;
+				await vm.sendClick(targetApp, x, y);
+				return "点击坐标成功";
+			}
+			throw new Error("Click指令缺少 text 或 coordinates");
+		} else if (actionData.action === "type") {
+			sender.send(AI_CHANNELS.STREAM_CHUNK, `\n⌨️ 输入:"${actionData.text}"`);
+			await vm.sendText(targetApp, actionData.text);
+			return "输入成功";
+		} else if (actionData.action === "scroll") {
+			const delta = actionData.direction === "up" ? -500 : 500;
+			sender.send(AI_CHANNELS.STREAM_CHUNK, `\n📜 滚动:${actionData.direction}`);
+			await vm.sendScroll(targetApp, delta);
+			await new Promise((r) => setTimeout(r, 500));
+			return "滚动成功";
+		}
+		return result;
 	}
 };
 var __dirname = path.dirname(fileURLToPath(import.meta.url));

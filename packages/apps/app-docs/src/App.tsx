@@ -20,13 +20,13 @@ function App() {
       </div>
       <h1>Vite + React</h1>
       <div className="card">
+        <br />
         <input type="text" placeholder="测试输入框" style={{ padding: 10, marginTop: 10 }} />
         <br />
         <button onClick={() => setCount((count) => count + 1)}>
           count is {count}
         </button>
         <br />
-        &nbsp;
         <br />
         <button onClick={() => setState((state) => !state)}>
           state is {state ? 'true' : 'false'}
@@ -34,6 +34,24 @@ function App() {
         <p>
           Edit <code>src/App.tsx</code> and save to test HMR
         </p>
+        <br />
+        <input type="text" placeholder="测试输入框" style={{ padding: 10, marginTop: 10 }} />
+        <br />
+        <br />
+        <input type="text" placeholder="测试输入框" style={{ padding: 10, marginTop: 10 }} />
+        <br />
+        <br />
+        <input type="text" placeholder="测试输入框" style={{ padding: 10, marginTop: 10 }} />
+        <br />
+        <br />
+        <input type="text" placeholder="测试输入框" style={{ padding: 10, marginTop: 10 }} />
+        <br />
+        <br />
+        <input type="text" placeholder="测试输入框" style={{ padding: 10, marginTop: 10 }} />
+        <br />
+        <br />
+        <input type="text" placeholder="测试输入框" style={{ padding: 10, marginTop: 10 }} />
+        <br />
       </div>
       <p className="read-the-docs">
         Click on the Vite and React logos to learn more

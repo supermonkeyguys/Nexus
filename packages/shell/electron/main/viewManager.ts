@@ -75,6 +75,31 @@ export class ViewManager {
         });
     }
 
+    public async sendScroll(appId: AppId, deltaY: number): Promise<boolean> {
+        const view = this.viewPool.get(appId);
+        if (!view) return false;
+
+        try {
+            view.webContents.focus();
+            
+            // 发送鼠标滚轮事件
+            // x, y 指定滚动发生的位置，通常指定为屏幕中心，防止滚错区域
+            const { width, height } = view.getBounds();
+            
+            await view.webContents.sendInputEvent({
+                type: 'mouseWheel',
+                x: Math.round(width / 2),
+                y: Math.round(height / 2),
+                deltaY: deltaY
+            });
+
+            return true;
+        } catch (error) {
+            console.error(`[ViewManager] 滚动失败:`, error);
+            return false;
+        }
+    }
+
     public resizeView(activeView: WebContentsView) {
         // 直接复用统一布局逻辑
         this.updateLayout();
